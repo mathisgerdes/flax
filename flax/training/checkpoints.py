@@ -30,7 +30,9 @@ from flax import core
 from flax import errors
 from flax import serialization
 from flax import traverse_util
+import jax
 from jax import process_index
+from jax.experimental import array
 from jax.experimental.global_device_array import GlobalDeviceArray
 from jax.experimental.multihost_utils import sync_global_devices
 from tensorflow.io import gfile  # pytype: disable=import-error
@@ -67,6 +69,7 @@ GDA_PH = '//GDAPlaceholder:'
 COMMIT_SUCCESS_FILE = 'commit_success.txt'
 
 PyTree = Any
+DistributedArrayType = Union[GlobalDeviceArray, array.Array]
 
 
 def _checkpoint_path(ckpt_dir: str,
@@ -114,19 +117,28 @@ class AsyncManager():
     self.save_future = self.executor.submit(task)
 
 
+def _use_gda_serialization(value: Any) -> bool:
+  """Use the GDA Serializer to save the array if it's a GDA, or is only partially available on this host."""
+  if isinstance(value, GlobalDeviceArray):
+    return True
+  if isinstance(value, array.Array):
+    return not value.is_fully_addressable()
+  return False
+
+
 def _split_gdas(
     target: Dict[str, Any]
-) -> Tuple[Dict[str, Any], List[Tuple[GlobalDeviceArray, str]]]:
+) -> Tuple[Dict[str, Any], List[Tuple[DistributedArrayType, str]]]:
   # When target is a single leaf instead of a pytree dict.
   if not isinstance(target, (core.FrozenDict, dict)):
-    if isinstance(target, GlobalDeviceArray):
+    if _use_gda_serialization(target):
       return GDA_PH, [(target, '')]
     return target, []
   # Traverse the target and handle GlobalDeviceArrays.
   flattened = traverse_util.flatten_dict(target, keep_empty_nodes=True)
   gda_targets = []
   for key, value in flattened.items():
-    if isinstance(value, GlobalDeviceArray):
+    if _use_gda_serialization(value):
       subpath = '/'.join(key)
       gda_targets.append((value, subpath))
       flattened[key] = GDA_PH + subpath
@@ -134,7 +146,7 @@ def _split_gdas(
   return target, gda_targets
 
 
-def _make_gda_dirs(gda_targets: List[Tuple[GlobalDeviceArray, str]],
+def _make_gda_dirs(gda_targets: List[Tuple[DistributedArrayType, str]],
                    tmp_path: str):
   gda_tmp_path = tmp_path + '_gda'
   # Clean up the previous GDA dir, in case some leftover from last preemption
@@ -147,7 +159,7 @@ def _make_gda_dirs(gda_targets: List[Tuple[GlobalDeviceArray, str]],
     gfile.makedirs(os.path.join(gda_tmp_path, subpath))
 
 
-def _save_gdas(gda_manager, gda_targets: List[Tuple[GlobalDeviceArray, str]],
+def _save_gdas(gda_manager, gda_targets: List[Tuple[DistributedArrayType, str]],
                tmp_path: str, final_path: str, base_path: str, keep: int,
                overwrite: bool, keep_every_n_steps: Optional[int],
                async_manager: Optional[AsyncManager] = None):
@@ -193,21 +205,36 @@ def _restore_gdas(state_dict,
       raise errors.GDARestoreTargetRequiredError(ckpt_path, step)
 
   def _safe_deserialize(
-      target_gdas: List[GlobalDeviceArray], gda_paths: List[str],
-      gda_manager: GlobalAsyncCheckpointManager) -> List[GlobalDeviceArray]:
+      target_gdas: List[DistributedArrayType], gda_paths: List[str],
+      gda_manager: GlobalAsyncCheckpointManager) -> List[DistributedArrayType]:
     gda_manager.wait_until_finished()
+
     # Check if reading from GCS and the GDA dir is potentially corrupted.
     if ckpt_path.startswith('gs://') and not gfile.exists(
         os.path.join(ckpt_path + '_gda', COMMIT_SUCCESS_FILE)):
       raise errors.GDARestoreDataCorruptedError(step, ckpt_path)
-    meshes = [x.mesh for x in target_gdas]
-    partition_specs = [x.mesh_axes for x in target_gdas]
+
+    # Check if the given target array types are valid.
+    meshes, partition_specs = [], []
+    for i, arr in enumerate(target_gdas):
+      # Use GDA with jax.config.jax_array turned off, or jax.experimental.array
+      # with jax.config.jax_array turned on. 
+      if isinstance(arr, GlobalDeviceArray) is jax.config.jax_array:
+        raise errors.GDARestoreTypeNotMatchError(step, gda_paths[i])
+      if isinstance(arr, GlobalDeviceArray):
+        meshes.append(arr.mesh)
+        partition_specs.append(arr.mesh_axes)
+      elif isinstance(arr, array.Array):
+        meshes.append(arr.sharding.mesh)
+        partition_specs.append(arr.sharding.spec)
+
+    # Restore the arrays.
     ts_specs = [get_tensorstore_spec(x) for x in gda_paths]
     return gda_manager.deserialize(meshes, partition_specs, ts_specs)
 
   # When target is a single leaf instead of a pytree dict.
   if not isinstance(state_dict, (core.FrozenDict, dict)):
-    if isinstance(target, GlobalDeviceArray) and isinstance(
+    if _use_gda_serialization(target) and isinstance(
         state_dict, str) and state_dict.startswith(GDA_PH):
       _check_gda_errors()
       return _safe_deserialize([target], [ckpt_path + '_gda'], gda_manager)[0]
@@ -226,7 +253,9 @@ def _restore_gdas(state_dict,
     target_flattened = traverse_util.flatten_dict(
         serialization.to_state_dict(target), keep_empty_nodes=True)
     target_gdas = [target_flattened[x[0]] for x in gda_paths]
-    if not all(isinstance(x, GlobalDeviceArray) for x in target_gdas):
+    # Make sure that for each entry with the GDA placeholder, the corresponding
+    # entry in target is a valid GDA or jax.Array.
+    if not all(_use_gda_serialization(x) for x in target_gdas):
       raise errors.GDARestoreTargetRequiredError(ckpt_path, step)
     gda_list = _safe_deserialize(target_gdas, [x[1] for x in gda_paths],
                                  gda_manager)
@@ -532,6 +561,7 @@ def save_checkpoint_multiprocess(ckpt_dir: Union[str, os.PathLike],
       ckpt_dir, step, prefix)
   if not overwrite:
     _check_overwrite_error(ckpt_tmp_path, ckpt_path, base_path, step)
+    sync_global_devices('check_overwrite_strictly_before_save')
   # Save the files via I/O sync or async.
   def save_main_ckpt_task():
     return _save_main_ckpt_file(target, has_gda, (ckpt_tmp_path, ckpt_path),
